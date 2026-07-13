@@ -1,0 +1,49 @@
+{
+  "auto_detect": true,
+  "version": "2.0.0",
+  "productionMode": true,
+  "request_time": 1,
+  "database_path": "database/",
+  "meters": [
+    {
+      "Meter_type": "PMAC211",
+      "MeterID": "1",
+      "Serail_Port": "/dev/ttyUSB0",
+      "Serial_Baudrate": 9600,
+      "serial": false,
+      "MQTT_topic": "meter_pmac211_1",
+      "PanelID": "00000000-0000-1000-8000-000000000000",
+      "ct_rates": {"1": 100, "2": 400, "3": 100, "4": 100}
+    }
+  ],
+  "Node": "SAN00011",
+  "api_push_enabled": true,
+  "api_push_url": "https://tools.ampenergy.ae/data",
+  "alert_level": "warning",
+  "api_push_interval": 30,
+  "api_push_time": [
+    "03",
+    "18",
+    "33",
+    "48"
+  ],
+  "backup_enabled": true,
+  "backup_url": "",
+  "backup_daily": true,
+  "backup_monthly": true,
+  "dropbox_backup_enabled": true,
+  "dropbox_token": "sl.u.AGhkXLGYxo8l0LeXBI6ec_FPx7wGquD-X4Uz4BAXZFFnTNLgaYz1q0Fq1wuzvr8Xj9dRpy7Y81iFjrkkqfVghND8qyto0xnqsj8_bQDT6wme8Fbt2dKtuqdi33IA8Fz8swl2uMzXrWKqNPNJGIYLB73st4bOXPayi3KDXQFZlfWqSLmRSfBpCBoTrWMi-a0kpWG7BAMtfX4rdll6sY8O3nRxyHODyAn6LzIAvLedcqgfMwYbQABwYBLyq_qvvYsyjx37S4SrJ6CZpLsl8TXe0BeqvHodgcaW1U6MChChvWGrKbZSlKYcnjlvjLVARQoeFPWL3MhX9Q-AorIB2JgM6q_wKcMjQhpAlubk9h_uM_bvtCOp1QKIlFlK60SDCTw237ziOhn2Iz0arNWkMBE-bstDG-MiV_7OUyJxap7fEwYcFPQfcgY_e6Dp8Bkrd7Rc7QlO20InwWpTqFNivFgTrfBSTehnIW6La84ny-9d5YG4EY6vkTNqLhAX1DulIKK9H8zxvkINlxNXfg-OWqJEmqKQbolzFeP07rQELyc4GGHcxvYEIBJfxpvJ9PvpAgcK8dd9EvEn3B9MAFzvPSNA3L-e-kVP23lG7bPNG3knPWg4N2dfjyr3CbGYmNdn3q1kdRlE2lSmvqZwd-stprmJc51WT6nvqSiYRk4ShPlkTt1WhDUtnmReT06gXOXuDQRFM4JH8vA9q3hxa5ZItZgpU-DvHFqG9Eu_2mmK9bXNEDENS6zkezcmG7QNTpTYK-PU6vwS8eprpAtQmgfcyXm3NiXOaCio7hXkbdhPUEpWfAAnChnjhMyLluXWzRQt0u6hDC2oHLUN9RaIxiQj9Aos7oOGPE5DwgjrOpZzHfz7XdmAONrmK8apF-1v2yOR576AVHKz97iyCfreZCRb8JHX23_xNHEPMKeCPimFH0Rev6kroBbcouN31YQ_WkhJcjGaUK6V-IevlWkuacV6_bb_ogzQIobltO2mqPzE2sdg4FdpBJAdMVGRv1CaJMLhZ5gOcj0MPlaykmzp-xyoIqjo5IgK1qlq8-QHuxBPQsJF6WVvSfn5ol7WRLTMJLs82bNBULChZuejsmPr_MqRTSPtiD76qAzFh9yBf6MKKAxvEeDY1J6eA2s65WT8D7rOMUC68uv1V-yQIb2P8708Av_nF0ag0K9VrRhYzzXFI7ECD11fnWqLXMoO_3N4_q0zwqxpii4G3GcmdI_QtiSZvW4FJsiqJ9GI8swO7YiQ7ypIPWKTkcFJ4xwoAPkrRKwFvBWUjMzvCoGK-UB5_6xGAB-G1dWDt266RC-dRbnqzFK-s7g6c8jNcVViBzwAKE8axcI8ECw",
+  "dropbox_path": "/panels-backups/",
+  "log_main_path": "logs/main/",
+  "APP_log_path": "logs/app/",
+  "APP_log_enable": true,
+  "readings_log_path": "logs/readings/",
+  "readings_log_enable": true,
+  "samples_log_path": "logs/samples/",
+  "samples_log_enable": true,
+  "meter_log_path": "logs/meter/",
+  "METER_log_enable": false,
+  "visible_App_Log": true,
+  "log_file_max_size": 10,
+  "log_max_files": 50
+}

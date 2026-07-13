@@ -1,0 +1,37 @@
+__pycache__/
+*.pyc
+*.pyo
+*.so
+*.egg-info/
+dist/
+build/
+*.egg
+.eggs/
+
+# Database and logs (runtime data, not source)
+database/
+logs/
+
+# Environment
+.env
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Cython build artifacts
+*.c
+*.o
+*.pyd
+
+# Deployment artifacts
+*.tar.gz

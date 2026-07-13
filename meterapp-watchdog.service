@@ -1,0 +1,10 @@
+[Unit]
+Description=meter-app-v2 Watchdog - monitors meterapp health
+After=meterapp.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /home/orangepi/meter-app-v2/src/watchdog.py
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,538 @@
+================================================================================
+                     meter-app-v2 — Complete Documentation
+                              Version 2.1.0
+================================================================================
+
+For bluetooth_manager, hub-agent, and any other agent that needs to
+understand the full system.
+
+================================================================================
+1. OVERVIEW
+================================================================================
+
+meter-app-v2 is a Python application that runs on an Orange Pi Zero 3 (ARM64,
+2GB RAM) as a systemd service. It:
+
+  - Reads electrical meters via RS485 Modbus RTU or Serial JSON
+  - Stores readings in SQLite (WAL mode) for crash safety
+  - Aggregates data into 15-minute windows
+  - Validates data quality (8 rules) and reports via TCP socket
+  - Pushes aggregated data to a REST API server
+  - Backs up database files to Dropbox
+  - Broadcasts real-time data to Bluetooth app and hub-agent via TCP socket
+
+================================================================================
+2. FILE STRUCTURE
+================================================================================
+
+meter-app-v2/
+  run.py                    Entry point — signal handling, main polling loop
+  config.json               Runtime configuration
+  requirements.txt          Python dependencies
+  VERSION                   Version string: "2.1.0"
+  meterapp.service          systemd service unit
+  meterapp-watchdog.service systemd watchdog unit
+  setup.sh                  OTA setup script
+  detect_meters.py          Standalone meter detection script
+  exportApp.py              Cython build script
+
+  src/
+    __init__.py             VERSION = "2.1.0"
+    app.py                  Orchestrator — creates meters, starts threads
+    config.py               Config loader, MAC→UUID, auto-detect, validation
+    meter.py                Per-meter read/decode/normalize/store/rescan
+    modbus.py               Modbus RTU client (pymodbus 2.5.3)
+    dSerial.py              Serial JSON reader for KITT meters
+    normalizer.py           PMAC211 channel flattening, channel counting
+    storage.py              SQLite WAL + monthly archiving + integrity check
+    aggregator.py           15-min aggregation (mean/sum)
+    api_pusher.py           HTTP POST to API server with retry
+    backup.py               Daily/monthly cloud backup (HTTP + Dropbox)
+    logger.py               Rotating file loggers + log size monitoring
+    validator.py            8-rule data validation engine
+    socket_server.py        TCP socket server localhost:5555
+    auto_detect.py          Meter auto-detection via serial ports
+    watchdog.py             Health check + auto-restart
+
+    meters_format/
+      format.py             Factory — maps meter type string to class
+      SPM32Format.py        SPM32 / SMP32 (3 CTs, Modbus RTU)
+      SMP20Format.py        SMP20 / SPM20 (30 CTs, Modbus RTU)
+      PMAC202Format.py      PMAC202 (42 CTs, Modbus RTU)
+      PMAC211Format.py      PMAC211 (4 groups x 3 phases, Modbus RTU)
+      SPM206CT42Format.py   SPM206 42-CT (Modbus RTU)
+      SPM206CT54Format.py   SPM206 54-CT (Modbus RTU)
+      KittFormat.py         KITT / Kitty (12 CTs, Serial JSON)
+
+  database/
+    active.db               Current month's data
+    archive/                Monthly archives (YYYY-MM.db)
+
+  logs/
+    main/                   Main app log
+    app/                    Per-meter app events
+    readings/               Per-meter 1-min CSV logs
+    samples/                Per-meter 15-min CSV logs
+    meter/                  Per-meter raw register logs
+
+================================================================================
+3. ARCHITECTURE
+================================================================================
+
+Meter(s) ──[RS485 / Serial]──> modbus.py / dSerial.py
+    |-> meter.py (decode, normalize, store)
+    |-> SQLite: readings_1min
+    |-> logger.py: CSV logs
+    |-> aggregator.py: 15-min windows
+    |-> SQLite: readings_15min
+    |-> api_pusher.py: HTTP POST ──> https://tools.ampenergy.ae/data
+    |-> backup.py: Dropbox upload
+    |-> socket_server.py: TCP localhost:5555
+            |-> Bluetooth App (AmpPro) ──BLE──> Mobile App
+            └-> hub-agent (Node.js) ──Socket.IO──> OTA Server
+
+================================================================================
+4. CONFIGURATION (config.json)
+================================================================================
+
+Key fields:
+
+  "auto_detect": false          Auto-detect meters on startup (true/false)
+  "version": "2.0.0"            App version string
+  "productionMode": false       false=use sample data, true=real hardware
+  "request_time": 1             Polling interval in MINUTES (0.1 = 6 seconds)
+  "database_path": "database/"  SQLite database directory
+
+  "meters": []                  Array of meter definitions
+    "Meter_type": "PMAC211"     Must match format.py factory
+    "MeterID": "1"              Modbus slave address
+    "Serail_Port": "/dev/ttyUSB0"  Serial port (intentional misspelling!)
+    "Serial_Baudrate": 9600     Baud rate
+    "serial": false             true=DSerial (JSON), false=Modbus RTU
+    "MQTT_topic": "meter1"      Meter label for logs
+    "PanelID": "auto-derived"   Device UUID (auto-set from MAC)
+
+  "Node": "SAN00011"            Node identifier
+  "api_push_enabled": false     Enable HTTP POST of 15-min records
+  "api_push_url": "https://tools.ampenergy.ae/data"
+  "api_push_interval": 30       Seconds between push attempts
+  "api_push_time": ["03","18","33","48"]  Push at these minutes past hour
+
+  "backup_enabled": false       Enable cloud backup
+  "backup_daily": true          Upload active.db daily
+  "backup_monthly": true        Upload archive monthly
+  "dropbox_backup_enabled": false   Enable Dropbox backup
+  "dropbox_token": ""           Dropbox OAuth2 token
+  "dropbox_path": "/panels-backups/"  Dropbox folder path
+
+  "subtractions": {}            Channel subtraction rules (removed in v2.1)
+
+================================================================================
+5. DATABASE SCHEMA (SQLite)
+================================================================================
+
+Table: readings_1min
+  id              INTEGER PRIMARY KEY AUTOINCREMENT
+  panel_id        TEXT NOT NULL      Device UUID
+  meter_id        TEXT NOT NULL      Modbus slave ID
+  meter_type      TEXT NOT NULL      SPM32, KITT, PMAC211, etc.
+  node            TEXT NOT NULL      Node identifier
+  timestamp_ms    INTEGER NOT NULL   Unix timestamp in milliseconds
+  data_json       TEXT NOT NULL      Full decoded reading as JSON
+  created_at      TEXT               Insert timestamp
+
+Table: readings_15min
+  id              INTEGER PRIMARY KEY AUTOINCREMENT
+  panel_id        TEXT NOT NULL
+  meter_id        TEXT NOT NULL
+  meter_type      TEXT NOT NULL
+  node            TEXT NOT NULL
+  channel_count   INTEGER NOT NULL
+  timestamp_ms    INTEGER NOT NULL   Window start (ms)
+  datetime_str    TEXT NOT NULL      Human-readable timestamp
+  grid_json       TEXT NOT NULL      Grid values (AV, BV, CV, F)
+  channels_json   TEXT NOT NULL      Per-channel aggregated data
+  totals_json     TEXT NOT NULL      Totals (TP, TQ, etc.)
+  sample_count    INTEGER            Number of 1-min readings averaged
+  send_status     TEXT               "pending" / "sent" / "failed"
+  sent_at         TEXT               When successfully sent
+  created_at      TEXT               Insert timestamp
+
+Table: readings_validation
+  id              INTEGER PRIMARY KEY AUTOINCREMENT
+  timestamp_ms    INTEGER NOT NULL
+  meter_id        TEXT NOT NULL
+  overall_status  TEXT NOT NULL      "OK" / "WARNING" / "CRITICAL"
+  checks_json     TEXT NOT NULL      JSON array of check results
+  confidence      REAL               0.0 to 1.0
+  issues_json     TEXT               JSON array of issue strings
+  created_at      TEXT               Insert timestamp
+
+Table: backups
+  id              INTEGER PRIMARY KEY AUTOINCREMENT
+  filename        TEXT NOT NULL
+  file_path       TEXT NOT NULL
+  file_type       TEXT               "active" or "archive"
+  upload_status   TEXT               "pending" / "sent" / "failed"
+  uploaded_at     TEXT               When uploaded
+  created_at      TEXT               Insert timestamp
+
+================================================================================
+6. SOCKET SERVER (localhost:5555)
+================================================================================
+
+Transport: TCP
+Port: 5555
+Format: Newline-delimited JSON
+Multiple clients supported (Bluetooth app, hub-agent, etc.)
+
+### 6.1 Outbound Messages (meter-app-v2 broadcasts)
+
+READING (broadcast on every meter read, ~every request_time):
+  {"type":"reading","data":{...}}
+  Data fields: timestamp, meter_id, meter_type, panel_id, node, data (full reading dict)
+
+VALIDATION (broadcast on every meter read):
+  {"type":"validation","data":{...}}
+  Data fields: status ("OK"/"WARNING"/"CRITICAL"), score (0.0-1.0),
+               checks (array), issues (array), cloud_push (bool), cloud_push_age_ms (int)
+
+HEALTH (broadcast every 30 seconds):
+  {"type":"health","data":{...}}
+  Data fields: meter_connected (bool), meter_type (string),
+               last_reading_age_ms (int), push_enabled (bool),
+               last_push_success (bool), last_push_time (float),
+               pending_push_count (int), uptime_seconds (int),
+               cpu_temp (float), memory_percent (float)
+
+ALERT (broadcast when validation is CRITICAL):
+  {"type":"alert","data":{...}}
+  Data fields: level ("CRITICAL"/"WARNING"), meter_id, meter_type,
+               message (string), issues (array)
+
+### 6.2 Inbound Commands (clients can send to meter-app-v2)
+
+COMMAND format:
+  {"type":"command","id":123,"action":"status"}
+  {"type":"command","id":124,"action":"config_read"}
+  {"type":"command","id":125,"action":"config_write","params":{...}}
+  {"type":"command","id":126,"action":"reload"}
+
+RESPONSE format:
+  {"type":"response","id":123,"status":"ok","data":{...}}
+
+Actions:
+  status         Returns current health data
+  config_read    Returns current config.json contents
+  config_write   Writes values to config.json
+  reload         Restarts the app to apply config changes
+
+================================================================================
+7. VALIDATION RULES
+================================================================================
+
+V1: Voltage plausibility
+    AV/BV/CV must be in (90-140) OR (180-240)
+    Severity: CRITICAL
+
+V2: Frequency plausibility
+    F must be 45-62 Hz
+    Severity: CRITICAL
+
+V3: Current plausibility
+    Each C{n}I must be >= 0
+    Severity: WARNING
+
+V4: Power factor range
+    Each C{n}PF must be 0-1.0
+    Severity: WARNING
+
+V5: Energy monotonicity
+    AE/RE must not decrease between consecutive readings
+    Severity: CRITICAL
+
+V6: Zero data detection
+    If all channels have I=0 for 3+ consecutive readings
+    Severity: CRITICAL
+
+V7: Spike detection
+    Power (C{n}P) jumps > 10x from previous reading
+    Severity: WARNING
+
+V8: Time gap detection
+    Gap between readings > 2x expected interval
+    Severity: WARNING
+
+Confidence score = ok_count / total_checks
+Overall status = CRITICAL if any CRITICAL, WARNING if any WARNING, else OK
+
+================================================================================
+8. AUTO-DETECTION
+================================================================================
+
+Triggered when:
+  - meters list is empty in config.json
+  - auto_detect flag is true
+  - meter becomes unresponsive (rescan-on-failure)
+
+Detection strategy:
+  1. Scan all serial ports
+  2. For each port, try baud rates [9600, 19200, 4800, 2400]
+  3. Thread-based timeout (2s) to avoid blocking on bad ports
+  4. Read signature registers for each meter type:
+     - PMAC211: addr 5017 (CT1 range 50-600)
+     - PMAC202: addr 0 count 60 (check VTHD < 1000)
+     - SPM206: addr 2201 (preset code 0-5)
+     - SMP20: addr 0 count 11 (AV>100, F~5000)
+     - SPM32: addr 212 (CTRatio 1-99999) + addr 42 (PTRatio > 100)
+  5. Return first confirmed match per port
+
+Supported meters for auto-detection: SPM32, PMAC211, PMAC202, SPM206, SMP20
+KITT (serial JSON) cannot be auto-detected via Modbus.
+
+================================================================================
+9. API PUSH FORMAT
+================================================================================
+
+POST https://tools.ampenergy.ae/data
+Content-Type: application/json
+
+{
+  "reading_time": "2026-06-10 12:52:53.454",
+  "panelid": "00000000-0000-1000-8000-...",
+  "channel_count": 12,
+  "total": [V, TI, TP, TQ, TS, TPF, TAE, TRE],
+  "channels": [
+    [C1V, 1, "a", C1I, C1P, C1Q, C1S, C1PF, C1AE, C1RE],
+    [C2V, 2, "b", C2I, C2P, C2Q, C2S, C2PF, C2AE, C2RE],
+    ...
+  ]
+}
+
+Phase assignment: channel_num % 3 == 1 -> "a", == 2 -> "b", == 0 -> "c"
+
+Schedule: push at minutes ["03","18","33","48"] past each hour
+
+================================================================================
+10. DROPBOX BACKUP
+================================================================================
+
+Account: ali alsaidi (ali@ampenergy.ae)
+App type: Scoped App (App Folder)
+App folder: panels-backups
+Path structure: /panels-backups/{PanelID}/{type}/{filename}
+
+Daily backup:
+  File: active_YYYY-MM-DD.db (snapshot of active.db)
+  Upload to: /panels-backups/{PanelID}/active/
+
+Monthly backup:
+  File: YYYY-MM.db (archived from previous month)
+  Upload to: /panels-backups/{PanelID}/archive/
+
+Test command:
+  python test_dropbox_direct.py
+
+================================================================================
+11. DEPLOYMENT
+================================================================================
+
+Target: Orange Pi 192.168.137.71 (orangepi/orangepi)
+
+1. SCP meter-app-v2/ to /opt/meter-app-v2/ (all apps in /opt/)
+2. cd /opt/meter-app-v2
+3. pip install -r requirements.txt
+4. Edit config.json (meter settings, API URL, Dropbox token)
+5. python run.py --detect  (auto-detect meter on serial port)
+6. sudo cp meterapp.service /etc/systemd/system/
+7. sudo cp meterapp-watchdog.service /etc/systemd/system/
+8. sudo systemctl enable --now meterapp meterapp-watchdog
+
+Note: meterapp.service runs as user 'orangepi', WorkingDirectory=/opt/meter-app-v2/
+
+================================================================================
+12. SYSTEMD SERVICES
+================================================================================
+
+meterapp.service:
+  ExecStart: /usr/bin/python3 /home/orangepi/meter-app-v2/run.py
+  Restart: on-failure
+  RestartSec: 10
+
+meterapp-watchdog.service:
+  ExecStart: /usr/bin/python3 /home/orangepi/meter-app-v2/src/watchdog.py
+  Runs every 60 seconds (OnBootSec + OnUnitActiveSec)
+
+Watchdog behavior:
+  - If service is active AND last reading < 10min old: healthy
+  - If service is active BUT no reading > 10min: restart service
+  - If service is not active: restart service
+  - After 3 failed restarts: force reboot
+
+================================================================================
+13. CLI FLAGS
+================================================================================
+
+  python run.py              Normal startup (with auto-detect if meters empty)
+  python run.py --detect     Detection only, print results, then exit
+
+  python detect_meters.py    Scan and print results
+  python detect_meters.py --save    Scan and write to config.json
+  python detect_meters.py --port COM12  Scan specific port only
+
+================================================================================
+14. METER TYPES
+================================================================================
+
+| Meter Type  | Class      | Comm    | Channels | Baud |
+|-------------|------------|---------|----------|------|
+| SPM32/SMP32 | SPM32      | Modbus  | 3 CTs    | 9600 |
+| SMP20/SPM20 | SMP20      | Modbus  | 30 CTs   | 9600 |
+| PMAC202     | PMAC202    | Modbus  | 42 CTs   | 9600 |
+| PMAC211     | PMAC211    | Modbus  | 12 CTs   | 9600 |
+| SPM206CT42  | SPM206     | Modbus  | 42 CTs   | 19200|
+| SPM206CT54  | SPM206     | Modbus  | 54 CTs   | 19200|
+| KITT        | KITT       | Serial  | 12 CTs   | 19200|
+
+Channel naming after normalization:
+  c{n}i, c{n}v, c{n}p, c{n}q, c{n}s, c{n}pf, c{n}ae, c{n}re
+  Grid: av, bv, cv, v, f
+  Totals: ti, tp, tq, ts, tpf, tae, tre
+
+PMAC211 normalization: C1Ia -> c1, C1Ib -> c2, C1Ic -> c3, etc.
+
+================================================================================
+15. WATCHDOG
+================================================================================
+
+File: src/watchdog.py
+Service: meterapp-watchdog.service (systemd oneshot, runs every 60s)
+
+Health check logic:
+  1. Check if meterapp.service is active (systemctl is-active)
+  2. Check last reading timestamp in SQLite (must be < 10 min old)
+  3. If healthy: log OK, save health status
+  4. If stuck: restart service
+  5. If service down: restart service
+  6. After 3 restart failures: sudo reboot
+
+Health status file: /tmp/meter-health.json
+
+================================================================================
+16. VERSION HISTORY
+================================================================================
+
+v2.0.0  Initial release
+        - SQLite WAL storage
+        - 15-min aggregation
+        - HTTP API push
+        - Auto-detection
+        - Monthly archiving
+
+v2.1.0  Current version
+        - Removed subtractions from config/normalizer
+        - SQLite corruption recovery (integrity check on startup)
+        - WAL cleanup + VACUUM
+        - Log directory size monitoring (>500MB warning)
+        - Config validation on load
+        - Read timeout (30s) for stuck serial ports
+        - 8-rule data validation engine
+        - TCP socket server (localhost:5555) with reading/validation/health/alert
+        - Bidirectional command support (config_read, config_write, reload)
+        - Dropbox backup integration
+        - Watchdog service (auto-restart, force reboot)
+        - API push format matches api15pusher for backward compatibility
+        - Energy spike correction in modbus.py
+        - SPM32 per-channel PT/CT multiplication
+        - PMAC211 channel flattening in normalizer
+        - Modbus bulk read fallback (one-by-one for PMAC211 addr 0)
+        - API pusher checks response body for 401 (not just HTTP status)
+        - Samples CSV logging after 15-min aggregation
+        - Config auto-detect triggers on invalid ports (e.g. COM12 on Linux)
+
+================================================================================
+17. WHAT AGENTS NEED TO KNOW
+================================================================================
+
+For Bluetooth Manager (AmpPro):
+  - Connect to TCP localhost:5555 as a client
+  - Receive: readings (every ~60s), validation (every ~60s),
+    health (every 30s), alerts (on CRITICAL)
+  - Expose data via BLE characteristics for mobile app
+  - See docs/bluetooth_agent_response.txt for full details
+
+For Hub-Agent (Node.js):
+  - Connect to TCP localhost:5555 as a client
+  - Receive: same as above
+  - Send commands: config_read, config_write, reload
+  - Forward alerts to OTA server via Socket.IO
+  - See docs/hub_agent_response.txt for full details
+
+For OTA Server:
+  - meter-app-v2 delivers via setup.sh + zip + VERSION
+  - Watchdog monitors service health
+  - Hub-agent reports meter health to OTA server
+
+================================================================================
+18. COMMON ISSUES
+================================================================================
+
+1. "Serail_Port" is intentionally misspelled — do NOT rename it
+2. request_time is in MINUTES not seconds (0.1 = 6 seconds)
+3. pymodbus 2.5.3 import path: pymodbus.client.sync
+4. This is a 2GB ARM device — avoid pandas, numpy, heavy libraries
+5. SQLite WAL mode requires -wal and -shm files alongside .db
+6. Dropbox token must have files.content.write scope
+7. Some Windows COM ports block on open — handled with thread timeout
+8. PMAC211 detected as SPM32 when reading wrong register — use addr 5017 not 200
+9. PMAC211 firmware: bulk reads from addr 0 fail (count>=2). One-by-one fallback
+   reads each register individually. ~12s for 208 registers.
+10. "serial" key in config: check VALUE not existence. Use info.get("serial", False)
+    not "serial" in info — the key always exists (even when false).
+11. API pusher: server returns HTTP 200 but body may contain 401. Check statusCode
+    in response body, not just HTTP status code.
+12. Orange Pi DNS: router DNS (192.168.137.1) has no recursion. Add 8.8.8.8 to
+    /etc/resolv.conf for external hostname resolution.
+
+================================================================================
+19. PMAC211 MODBUS BEHAVIOR (Important!)
+================================================================================
+
+The PMAC211 has firmware quirks that affect Modbus RTU reads:
+
+  - Address 0: Only count=1 works. count>=2 returns 0 or no response.
+  - Addresses 35, 70, 105, 200, 264: Bulk reads work (count=34-35).
+  - After failed bulk read on addr 0: subsequent reads fail until reconnect.
+  - Reading payloads: [0/35, 35/35, 70/35, 105/35, 200/34, 264/34]
+  - One-by-one fallback: ~12s for 208 registers (6 blocks × 35 reads × 0.03s)
+
+The modbus.py _read_payload() method handles this:
+  1. Try bulk read first
+  2. If bulk fails or returns wrong count → read one-by-one
+  3. Failed individual registers get value 0 (dead register)
+  4. Continue reading remaining registers (don't abort)
+
+Auto-detect uses register 5017 (CT1) which always works with count=1.
+
+================================================================================
+20. API PUSH BEHAVIOR
+================================================================================
+
+URL: https://tools.ampenergy.ae/data
+Schedule: minutes [:03, :18, :33, :48] past each hour
+Format: JSON with reading_time, panelid, channel_count, total, channels
+
+The server returns HTTP 200 but the response body may contain:
+  {"azurestatus": 401, "errors": {"API2": "Panel not registered."}}
+
+The api_pusher.py checks statusCode in the response body:
+  - If statusCode == 200: mark as "sent"
+  - If statusCode != 200: mark as "failed", will retry next cycle
+
+Records marked as "sent" will NOT be re-pushed even if the server
+rejected them (401). When the panel is registered on the Azure backend,
+only NEW records will be pushed.
+
+================================================================================
+END OF DOCUMENTATION
+================================================================================

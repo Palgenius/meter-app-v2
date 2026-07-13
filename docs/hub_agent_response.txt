@@ -1,0 +1,118 @@
+# Response for hub-agent Agent
+
+## Status: meter-app-v2 socket server is ready
+
+The TCP socket server runs on **localhost:5555** and broadcasts 4 message types.
+Both Bluetooth app and hub-agent connect as clients to the same socket.
+Bidirectional commands are supported.
+
+## Files Modified in meter-app-v2
+
+| File | Changes |
+|---|---|
+| src/socket_server.py | Added send_health(), set_health(), 30s health broadcast, command handling |
+| src/app.py | Added _update_health(), cloud_push in validation |
+| src/api_pusher.py | Added last_push_success/last_push_time tracking |
+
+## Socket Protocol
+
+### Outbound (meter-app-v2 broadcasts to all clients)
+
+**Reading** — every meter read (~every 60s):
+```json
+{
+  "type": "reading",
+  "data": {
+    "timestamp": 1781089609259,
+    "meter_id": "1",
+    "meter_type": "PMAC211",
+    "panel_id": "00000000-0000-1000-8000-...",
+    "node": "SAN00011",
+    "data": {"av": 236.07, "bv": 235.92, "c1i": 1.23, ...}
+  }
+}
+```
+
+**Validation** — every meter read, includes cloud push status:
+```json
+{
+  "type": "validation",
+  "data": {
+    "status": "OK",
+    "score": 0.98,
+    "checks": [{"rule": "V1", "status": "OK", "message": "AV=236.1V"}],
+    "issues": [],
+    "cloud_push": true,
+    "cloud_push_age_ms": 5000
+  }
+}
+```
+
+**Health** — broadcast every 30 seconds:
+```json
+{
+  "type": "health",
+  "data": {
+    "meter_connected": true,
+    "meter_type": "PMAC211",
+    "last_reading_age_ms": 1200,
+    "push_enabled": true,
+    "last_push_success": true,
+    "last_push_time": 1750000000.0,
+    "pending_push_count": 0,
+    "uptime_seconds": 3600,
+    "cpu_temp": 0.0,
+    "memory_percent": 0.0
+  }
+}
+```
+
+**Alert** — when validation is CRITICAL:
+```json
+{
+  "type": "alert",
+  "data": {
+    "level": "CRITICAL",
+    "meter_id": "1",
+    "meter_type": "PMAC211",
+    "message": "Validation CRITICAL: AV=50.0V...",
+    "issues": ["AV=50.0V out of range (90-140 or 180-240)"]
+  }
+}
+```
+
+### Inbound Commands (hub-agent can send)
+
+```json
+{"type": "command", "id": 123, "action": "status"}
+{"type": "command", "id": 124, "action": "config_read"}
+{"type": "command", "id": 125, "action": "config_write", "params": {"request_time": 5}}
+{"type": "command", "id": 126, "action": "reload"}
+```
+
+Response:
+```json
+{"type": "response", "id": 123, "status": "ok", "data": {...}}
+```
+
+## What Hub-Agent Should Do
+
+1. Connect to localhost:5555 as TCP client
+2. Handle `health` message type (add to _handleMessage)
+3. Forward `alert` messages to OTA server via Socket.IO
+4. Forward `validation` status to OTA server
+5. Forward `health` status to OTA server
+6. Send `status` command periodically for health monitoring
+7. Send `config_read`/`config_write` for remote configuration
+
+## Testing
+
+```bash
+nc localhost 5555
+# Shows reading + validation + health JSON messages
+echo '{"type":"command","id":1,"action":"status"}' | nc localhost 5555
+```
+
+## Full Documentation
+
+See docs/DOCUMENTATION.txt in meter-app-v2 for the complete system reference.

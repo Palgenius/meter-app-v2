@@ -1,0 +1,6 @@
+pymodbus==2.5.3
+pyserial
+csv-logger
+netifaces
+requests
+cython

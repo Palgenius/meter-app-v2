@@ -1,0 +1,17 @@
+[Unit]
+Description=Meter App v2.1.0 - Energy Meter Reading Service
+After=network.target
+
+[Service]
+Type=simple
+User=orangepi
+WorkingDirectory=/opt/meter-app-v2
+ExecStart=/usr/bin/python3 run.py
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=meterapp
+
+[Install]
+WantedBy=multi-user.target
