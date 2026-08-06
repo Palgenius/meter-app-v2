@@ -55,19 +55,19 @@ class Backup:
             try:
                 now = datetime.now()
 
-                # Monthly archive (1st of month, after 00:30)
+                # Daily database maintenance (runs once per day)
+                if self.daily_enabled:
+                    today = now.strftime("%Y-%m-%d")
+                    if self._last_daily_date != today:
+                        self._do_daily_maintenance()
+                        self._last_daily_date = today
+
+                # Monthly archive (1st of month, after 01:00)
                 if self.monthly_enabled and now.day == 1 and now.hour >= 1:
                     month_key = now.strftime("%Y-%m")
                     if self._last_archive_month != month_key:
                         self._do_monthly_archive()
                         self._last_archive_month = month_key
-
-                # Daily active.db backup
-                if self.daily_enabled:
-                    today = now.strftime("%Y-%m-%d")
-                    if self._last_daily_date != today:
-                        self._do_daily_backup()
-                        self._last_daily_date = today
 
                 # Retry any pending backups
                 self._retry_pending()
@@ -77,14 +77,44 @@ class Backup:
 
             time.sleep(3600)  # Check once per hour
 
+    def _do_daily_maintenance(self):
+        """Daily database maintenance: archive 1-min data, cleanup old 15-min, VACUUM.
+        
+        This keeps active.db small by moving old data to archive.db.
+        """
+        self._log_info("Starting daily database maintenance...")
+
+        # 1. Move 1-min readings older than 2 hours to archive.db
+        moved = self.storage.move_1min_to_archive(max_age_hours=2)
+        if moved > 0:
+            self._log_info(f"Archived {moved} 1-min records to archive.db")
+
+        # 2. Delete sent 15-min records older than 7 days
+        deleted = self.storage.delete_sent_15min(min_age_days=7)
+        if deleted > 0:
+            self._log_info(f"Cleaned {deleted} old sent 15-min records")
+
+        # 3. Check sizes and VACUUM
+        active_mb, archive_mb = self.storage.check_and_vacuum()
+        self._log_info(f"DB sizes after maintenance: active={active_mb:.1f}MB, archive={archive_mb:.1f}MB")
+
+        # 4. Create daily backup snapshot
+        self._do_daily_backup()
+
     def _do_monthly_archive(self):
-        """Archive previous month's data and queue for upload."""
+        """Export archive.db previous month as compressed .db.gz and queue for Dropbox upload."""
         self._log_info("Starting monthly archive...")
-        archive_path = self.storage.archive_previous_month()
-        if archive_path and os.path.exists(archive_path):
-            filename = os.path.basename(archive_path)
-            self.storage.insert_backup_record(filename, archive_path, file_type="archive")
-            self._log_info(f"Monthly archive queued: {filename}")
+        try:
+            # Export and compress the previous month from archive.db
+            gz_path = self.storage.compress_archive()
+            if gz_path and os.path.exists(gz_path):
+                filename = os.path.basename(gz_path)
+                self.storage.insert_backup_record(filename, gz_path, file_type="archive")
+                self._log_info(f"Monthly archive queued: {filename}")
+            else:
+                self._log_info("No data to archive for previous month")
+        except Exception as ex:
+            self._log_error(f"Monthly archive failed: {ex}", ex)
 
     def _do_daily_backup(self):
         """Create a snapshot of active.db and queue for upload."""

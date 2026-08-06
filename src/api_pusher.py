@@ -7,6 +7,7 @@ Runs as a background thread, retries on failure.
 
 import json
 import time
+import socket
 import requests
 
 
@@ -29,6 +30,9 @@ class APIPusher:
         self.last_push_time = None  # timestamp of last successful push
         self.last_push_payload = None  # last 15-min sample pushed to cloud
         self._consecutive_failures = 0  # track for alert threshold
+        self._internet_ok = None  # cached internet status (None = unknown)
+        self._internet_check_time = 0  # last time we checked internet
+        self._no_internet_log_time = 0  # last time we logged "no internet" (avoid spam)
 
     def push_thread(self):
         """Background thread: check for pending 15-min records and push them.
@@ -48,6 +52,16 @@ class APIPusher:
                 continue
 
             try:
+                # Fast internet check BEFORE touching the database or trying to send
+                if not self._check_internet():
+                    # No internet — sleep 60s and retry. Don't log every time.
+                    now = time.time()
+                    if now - self._no_internet_log_time > 300:  # log max once per 5 min
+                        self._log_error("No internet connection, waiting 60s")
+                        self._no_internet_log_time = now
+                    time.sleep(60)
+                    continue
+
                 # Periodically reset failed records back to pending for retry
                 if time.time() - last_retry_time > retry_interval:
                     last_retry_time = time.time()
@@ -91,6 +105,29 @@ class APIPusher:
             except Exception as ex:
                 self._log_error("push_thread error", ex)
                 time.sleep(self.interval)
+
+    def _check_internet(self):
+        """Fast internet check via DNS socket connect.
+        
+        Returns True if internet is available, False otherwise.
+        Caches result for 30 seconds to avoid checking every cycle.
+        Uses socket.create_connection to 8.8.8.8:53 (Google DNS).
+        """
+        now = time.time()
+        # Return cached result if recent enough
+        if self._internet_ok is not None and now - self._internet_check_time < 30:
+            return self._internet_ok
+        
+        try:
+            sock = socket.create_connection(("8.8.8.8", 53), timeout=2)
+            sock.close()
+            self._internet_ok = True
+            self._internet_check_time = now
+            return True
+        except (socket.timeout, OSError):
+            self._internet_ok = False
+            self._internet_check_time = now
+            return False
 
     def _send_record(self, record):
         """Send a single 15-min record to the API.

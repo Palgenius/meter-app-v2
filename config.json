@@ -45,5 +45,13 @@
   "METER_log_enable": false,
   "visible_App_Log": true,
   "log_file_max_size": 10,
-  "log_max_files": 50
+  "log_max_files": 50,
+  "database_cleanup": {
+    "active_db_max_mb": 200,
+    "move_1min_after_aggregation": true,
+    "delete_sent_15min_after_days": 7,
+    "vacuum_daily": true,
+    "monthly_archive_upload": true,
+    "compress_archive": true
+  }
 }

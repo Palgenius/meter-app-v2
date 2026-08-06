@@ -2,6 +2,7 @@ import sqlite3
 import json
 import shutil
 import os
+import time
 from datetime import datetime, timedelta
 from os import makedirs, path
 
@@ -17,7 +18,9 @@ class Storage:
         makedirs(db_dir, exist_ok=True)
         makedirs(self.archive_dir, exist_ok=True)
         self._conn = None
+        self._archive_conn = None
         self._connect()
+        self._connect_archive()
         self._create_tables()
 
     def _connect(self):
@@ -432,8 +435,286 @@ class Storage:
     # ── Helpers ──────────────────────────────────────────────────────
 
     def close(self):
+        """Close both active and archive database connections."""
+        if self._archive_conn:
+            try:
+                self._archive_conn.close()
+            except Exception:
+                pass
         if self._conn:
             self._conn.close()
+
+    # ── Archive Database (Phase 2) ─────────────────────────────────
+
+    def _connect_archive(self):
+        """Connect to archive.db with WAL mode. Creates tables if needed."""
+        archive_path = path.join(self.db_dir, "archive.db")
+        try:
+            self._archive_conn = sqlite3.connect(archive_path, check_same_thread=False)
+            self._archive_conn.execute("PRAGMA journal_mode=WAL")
+            self._archive_conn.execute("PRAGMA synchronous=NORMAL")
+            self._archive_conn.row_factory = sqlite3.Row
+            # Create readings_1min table (same schema as active.db)
+            self._archive_conn.execute("""
+                CREATE TABLE IF NOT EXISTS readings_1min (
+                    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                    panel_id     TEXT NOT NULL,
+                    meter_id     TEXT NOT NULL,
+                    meter_type   TEXT NOT NULL,
+                    node         TEXT NOT NULL,
+                    timestamp_ms INTEGER NOT NULL,
+                    data_json    TEXT NOT NULL,
+                    created_at   TEXT DEFAULT (datetime('now'))
+                )
+            """)
+            self._archive_conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_arc_1min_ts ON readings_1min(panel_id, meter_id, timestamp_ms)")
+            self._archive_conn.commit()
+            self._log_info("Archive database connected")
+        except Exception as ex:
+            self._log_error(f"Archive DB connection failed: {ex}", ex)
+            self._archive_conn = None
+
+    def move_1min_to_archive(self, max_age_hours=2):
+        """Move 1-min readings older than max_age_hours from active.db to archive.db.
+        
+        Called daily from backup thread. Keeps active.db small.
+        Returns number of rows moved.
+        """
+        if not self._archive_conn:
+            self._connect_archive()
+        if not self._archive_conn:
+            return 0
+
+        try:
+            cutoff_ms = int((time.time() - max_age_hours * 3600) * 1000)
+            # Count rows to move
+            count_row = self._conn.execute(
+                "SELECT COUNT(*) as cnt FROM readings_1min WHERE timestamp_ms < ?",
+                (cutoff_ms,)
+            ).fetchone()
+            count = count_row["cnt"] if count_row else 0
+            if count == 0:
+                return 0
+
+            # Copy to archive.db in batches
+            batch_size = 1000
+            moved = 0
+            while moved < count:
+                rows = self._conn.execute(
+                    "SELECT * FROM readings_1min WHERE timestamp_ms < ? ORDER BY timestamp_ms LIMIT ?",
+                    (cutoff_ms, batch_size)
+                ).fetchall()
+                if not rows:
+                    break
+                cols = [d[0] for d in self._conn.execute("SELECT * FROM readings_1min LIMIT 1").description]
+                placeholders = ",".join(["?"] * len(cols))
+                col_names = ",".join(cols)
+                self._archive_conn.executemany(
+                    f"INSERT INTO readings_1min ({col_names}) VALUES ({placeholders})",
+                    [tuple(r) for r in rows]
+                )
+                self._archive_conn.commit()
+                # Delete from active
+                ids = [r["id"] for r in rows]
+                id_placeholders = ",".join(["?"] * len(ids))
+                self._conn.execute(
+                    f"DELETE FROM readings_1min WHERE id IN ({id_placeholders})", ids
+                )
+                self._conn.commit()
+                moved += len(rows)
+
+            self._log_info(f"Moved {moved} 1-min records to archive.db (>{max_age_hours}h old)")
+            return moved
+        except Exception as ex:
+            self._log_error(f"move_1min_to_archive failed: {ex}", ex)
+            return 0
+
+    def delete_sent_15min(self, min_age_days=7):
+        """Delete 15-min records that were sent to server and are older than min_age_days.
+        
+        Called daily from backup thread. These records are confirmed on the server
+        so we don't need them locally anymore (15-min can be recalculated from 1-min).
+        Returns number of rows deleted.
+        """
+        try:
+            cutoff_ms = int((time.time() - min_age_days * 86400) * 1000)
+            count_row = self._conn.execute(
+                "SELECT COUNT(*) as cnt FROM readings_15min WHERE send_status='sent' AND timestamp_ms < ?",
+                (cutoff_ms,)
+            ).fetchone()
+            count = count_row["cnt"] if count_row else 0
+            if count == 0:
+                return 0
+            self._conn.execute(
+                "DELETE FROM readings_15min WHERE send_status='sent' AND timestamp_ms < ?",
+                (cutoff_ms,)
+            )
+            self._conn.commit()
+            self._log_info(f"Deleted {count} sent 15-min records (>{min_age_days} days old)")
+            return count
+        except Exception as ex:
+            self._log_error(f"delete_sent_15min failed: {ex}", ex)
+            return 0
+
+    def get_db_size_mb(self, db_path=None):
+        """Get database file size in MB."""
+        if db_path is None:
+            db_path = self.db_path
+        try:
+            return os.path.getsize(db_path) / (1024 * 1024)
+        except Exception:
+            return 0
+
+    def check_and_vacuum(self, max_active_mb=200):
+        """Check active.db size and VACUUM if needed.
+        
+        Logs current sizes of both databases.
+        Emergency: if active.db exceeds max_active_mb, force-move all 1-min data.
+        Returns (active_mb, archive_mb) tuple.
+        """
+        try:
+            import time as _time
+            active_mb = self.get_db_size_mb()
+            archive_mb = self.get_db_size_mb(path.join(self.db_dir, "archive.db"))
+
+            self._log_info(f"DB sizes: active={active_mb:.1f}MB, archive={archive_mb:.1f}MB")
+
+            # Emergency cleanup if active.db too large
+            if active_mb > max_active_mb:
+                self._log_error(f"active.db is {active_mb:.1f}MB (>{max_active_mb}MB) — emergency cleanup!", None)
+                # Force-move ALL 1-min data to archive
+                self.move_1min_to_archive(max_age_hours=0)
+                # Also delete old sent 15-min records
+                self.delete_sent_15min(min_age_days=1)
+
+            # VACUUM to reclaim space
+            self._conn.execute("VACUUM")
+            self._log_info("VACUUM completed")
+
+            # Check WAL file
+            wal_path = self.db_path + "-wal"
+            if path.exists(wal_path):
+                wal_size_mb = os.path.getsize(wal_path) / (1024 * 1024)
+                if wal_size_mb > 10:
+                    self._log_error(f"WAL file is {wal_size_mb:.1f}MB (threshold: 10MB)", None)
+
+            # Re-check after cleanup
+            final_mb = self.get_db_size_mb()
+            if final_mb != active_mb:
+                self._log_info(f"active.db after VACUUM: {final_mb:.1f}MB (was {active_mb:.1f}MB)")
+
+            return (final_mb, archive_mb)
+        except Exception as ex:
+            self._log_error(f"check_and_vacuum failed: {ex}", ex)
+            return (0, 0)
+
+    def compress_archive(self, month_str=None):
+        """Export a month of archive.db data to a compressed .db.gz file.
+        
+        Args:
+            month_str: Month in 'YYYY-MM' format. If None, uses previous month.
+        
+        Returns:
+            Path to the .db.gz file, or None on failure.
+        """
+        import gzip
+        import time as _time
+
+        if not self._archive_conn:
+            self._connect_archive()
+        if not self._archive_conn:
+            return None
+
+        if month_str is None:
+            now = datetime.now()
+            first_of_month = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+            prev = first_of_month - timedelta(days=1)
+            month_str = prev.strftime("%Y-%m")
+
+        export_name = f"{month_str}.db"
+        export_path = path.join(self.archive_dir, export_name)
+        gz_path = path.join(self.archive_dir, f"{export_name}.gz")
+
+        if path.exists(gz_path):
+            self._log_info(f"Compressed archive {export_name}.gz already exists, skipping")
+            return gz_path
+
+        try:
+            # Calculate timestamp range for the month
+            year, month = int(month_str[:4]), int(month_str[5:7])
+            start_dt = datetime(year, month, 1)
+            if month == 12:
+                end_dt = datetime(year + 1, 1, 1)
+            else:
+                end_dt = datetime(year, month + 1, 1)
+            start_ms = int(start_dt.timestamp() * 1000)
+            end_ms = int(end_dt.timestamp() * 1000)
+
+            # Create export database
+            export_conn = sqlite3.connect(export_path)
+            export_conn.execute("PRAGMA journal_mode=WAL")
+            export_conn.execute("""
+                CREATE TABLE IF NOT EXISTS readings_1min (
+                    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                    panel_id     TEXT NOT NULL,
+                    meter_id     TEXT NOT NULL,
+                    meter_type   TEXT NOT NULL,
+                    node         TEXT NOT NULL,
+                    timestamp_ms INTEGER NOT NULL,
+                    data_json    TEXT NOT NULL,
+                    created_at   TEXT DEFAULT (datetime('now'))
+                )
+            """)
+
+            # Copy data from archive.db for the target month
+            rows = self._archive_conn.execute(
+                "SELECT * FROM readings_1min WHERE timestamp_ms >= ? AND timestamp_ms < ? ORDER BY timestamp_ms",
+                (start_ms, end_ms)
+            ).fetchall()
+            if rows:
+                cols = [d[0] for d in self._archive_conn.execute("SELECT * FROM readings_1min LIMIT 1").description]
+                placeholders = ",".join(["?"] * len(cols))
+                col_names = ",".join(cols)
+                export_conn.executemany(
+                    f"INSERT INTO readings_1min ({col_names}) VALUES ({placeholders})",
+                    [tuple(r) for r in rows]
+                )
+                export_conn.commit()
+            export_conn.close()
+
+            # Compress with gzip
+            with open(export_path, 'rb') as f_in:
+                with gzip.open(gz_path, 'wb') as f_out:
+                    shutil.copyfileobj(f_in, f_out)
+
+            # Remove uncompressed copy
+            os.remove(export_path)
+
+            gz_size_mb = os.path.getsize(gz_path) / (1024 * 1024)
+            self._log_info(f"Compressed archive: {export_name}.gz ({gz_size_mb:.1f}MB, {len(rows)} records)")
+
+            # Delete exported month from archive.db to keep it manageable
+            if rows:
+                self._archive_conn.execute(
+                    "DELETE FROM readings_1min WHERE timestamp_ms >= ? AND timestamp_ms < ?",
+                    (start_ms, end_ms)
+                )
+                self._archive_conn.commit()
+                self._archive_conn.execute("VACUUM")
+                self._log_info(f"Cleaned {month_str} from archive.db after export")
+
+            return gz_path
+        except Exception as ex:
+            self._log_error(f"compress_archive failed: {ex}", ex)
+            # Clean up partial files
+            for p in [export_path, gz_path]:
+                if path.exists(p):
+                    try:
+                        os.remove(p)
+                    except Exception:
+                        pass
+            return None
 
     # Phase 1.3: WAL cleanup + VACUUM
     def vacuum_and_cleanup(self):
