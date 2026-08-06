@@ -1,6 +1,9 @@
 from pymodbus.client.sync import ModbusSerialClient as ModbusClient
 import time
+import threading
 # mbpoll -a 1 -b 9600 -t 3 -r 1 -c 2 /dev/ttyUSB0
+
+CONNECT_TIMEOUT = 10  # seconds — kill connect() if serial port blocks
 
 
 class Modbus:
@@ -20,14 +23,35 @@ class Modbus:
         if(self.productionMode):
             self.client = ModbusClient(method='rtu', port=self._port,
                                        baudrate=self._baudrate, stopbits=1, parity='N', bytesize=8, timeout=2)
-            self.client.connect()
-            self.logger.insert_Info_APP_log("modbus is connected")
-            time.sleep(2)
+            self._safe_connect(self.client, "modbus is connected")
+            time.sleep(1)  # reduced from 2s to 1s settle time
+
+    def _safe_connect(self, client, success_msg):
+        """Connect with a timeout thread to prevent blocking on stuck serial ports."""
+        result = [None]
+        def _do_connect():
+            try:
+                result[0] = client.connect()
+            except Exception as ex:
+                result[0] = ex
+        t = threading.Thread(target=_do_connect, daemon=True)
+        t.start()
+        t.join(timeout=CONNECT_TIMEOUT)
+        if t.is_alive():
+            self.logger.insert_Error_APP_log(
+                f'modbus connect timed out after {CONNECT_TIMEOUT}s (port {self._port} stuck)')
+            raise ConnectionError(f"Modbus connect timed out on {self._port}")
+        if isinstance(result[0], Exception):
+            raise result[0]
+        self.logger.insert_Info_APP_log(success_msg)
 
     def closeConnection(self):
         self.logger.insert_Info_APP_log('modbus disconnected..')
         if(self.productionMode):
-            self.client.close()
+            try:
+                self.client.close()
+            except Exception:
+                pass
 
     def reconnect(self):
         """Close and reopen the serial connection with a settle delay.
@@ -38,13 +62,15 @@ class Modbus:
         if not self.productionMode:
             return True
         try:
-            self.client.close()
+            try:
+                self.client.close()
+            except Exception:
+                pass
             time.sleep(0.5)
             self.client = ModbusClient(method='rtu', port=self._port,
                                        baudrate=self._baudrate, stopbits=1, parity='N', bytesize=8, timeout=2)
-            self.client.connect()
-            self.logger.insert_Info_APP_log('modbus reconnected')
-            time.sleep(1)  # settle the RS485 bus
+            self._safe_connect(self.client, 'modbus reconnected')
+            time.sleep(0.5)  # settle the RS485 bus (reduced from 1s)
             return True
         except Exception as ex:
             self.logger.insert_Error_APP_log(f'modbus reconnect failed: {ex}')

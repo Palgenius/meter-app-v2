@@ -14,6 +14,8 @@ from src.auto_detect import rescan_for_meter, detect_any_meter
 
 MAX_READ_FAILURES = 3  # consecutive failures before rescan
 READ_TIMEOUT = 30  # seconds — kill grapData if it hangs
+RESCAN_TIMEOUT = 120  # seconds — kill rescan if it takes too long
+SIGNATURE_TIMEOUT = 15  # seconds — kill signature check if it hangs
 
 
 class Meter:
@@ -63,6 +65,9 @@ class Meter:
         Called after MAX_READ_FAILURES consecutive read failures.
         First tries to find the same meter type on any port.
         If not found, detects ANY meter type and reconfigures.
+        
+        Runs the scan in a background thread with RESCAN_TIMEOUT to prevent
+        blocking the main loop indefinitely.
         """
         known_port = self.meter_info.get("Serail_Port")
         self.logger.insert_Info_APP_log(
@@ -74,14 +79,36 @@ class Meter:
         except Exception:
             pass
         
-        # Try 1: Find the same meter type on any port
-        detection = rescan_for_meter(self.meter_type, known_port)
+        # Run scan in a thread with timeout to prevent blocking the main loop
+        result = [None]
+        def _scan():
+            try:
+                # Try 1: Find the same meter type on any port
+                detection = rescan_for_meter(self.meter_type, known_port)
+                # Try 2: If not found, detect ANY meter type
+                if not detection:
+                    self.logger.insert_Info_APP_log(
+                        f"[{self.meter_type}_{self.meter_id}] {self.meter_type} not found — scanning for any meter...")
+                    detection = detect_any_meter(known_port)
+                result[0] = detection
+            except Exception as ex:
+                self.logger.insert_Error_APP_log(
+                    f"[{self.meter_type}_{self.meter_id}] Rescan exception: {ex}")
+                result[0] = None
         
-        # Try 2: If not found, detect ANY meter type (meter may have been swapped)
-        if not detection:
-            self.logger.insert_Info_APP_log(
-                f"[{self.meter_type}_{self.meter_id}] {self.meter_type} not found — scanning for any meter...")
-            detection = detect_any_meter(known_port)
+        scan_thread = threading.Thread(target=_scan, daemon=True)
+        scan_thread.start()
+        scan_thread.join(timeout=RESCAN_TIMEOUT)
+        
+        if scan_thread.is_alive():
+            # Scan took too longer — abandon and reconnect to known port
+            self.logger.insert_Error_APP_log(
+                f"[{self.meter_type}_{self.meter_id}] Rescan timed out after {RESCAN_TIMEOUT}s — "
+                f"reconnecting to known port {known_port}")
+            self._reconnect_to_port(known_port)
+            return
+        
+        detection = result[0]
         
         if detection:
             new_port = detection["port"]
@@ -121,16 +148,23 @@ class Meter:
         else:
             self.logger.insert_Error_APP_log(
                 f"[{self.meter_type}_{self.meter_id}] Rescan failed — no meter found on any port")
-            # Reset to known port for next rescan attempt
+            self._reconnect_to_port(known_port)
+    
+    def _reconnect_to_port(self, port):
+        """Reconnect to a specific port, non-blocking."""
+        try:
             if self.meter_info.get("serial", False):
-                self.modbus = DSerial(self.meterFormat, known_port,
+                self.modbus = DSerial(self.meterFormat, port,
                                       self.meter_info["Serial_Baudrate"],
                                       self.productionMode, self.logger)
             else:
-                self.modbus = Modbus(self.meterFormat, known_port,
+                self.modbus = Modbus(self.meterFormat, port,
                                      self.meter_info["Serial_Baudrate"],
                                      self.productionMode, self.logger)
-            self.consecutive_failures = 0
+        except Exception as ex:
+            self.logger.insert_Error_APP_log(
+                f"[{self.meter_type}_{self.meter_id}] Reconnect to {port} failed: {ex}")
+        self.consecutive_failures = 0
 
     @staticmethod
     def _sig_matches(sig, val):
@@ -150,112 +184,75 @@ class Meter:
         - range:  {"wire_addr": N, "min": A, "max": B}  — value must be in [A..B]
         
         On first failure, reconnects and retries once before triggering rescan.
+        Runs in a thread with SIGNATURE_TIMEOUT to prevent blocking the main loop.
         """
         if not hasattr(self.modbus, 'client'):
             return True  # can't check, assume OK
         
-        client = self.modbus.client
         expected_type = self.meter_type
         sig = self._signature.get(expected_type)
         if not sig:
             return True  # unknown type, skip check
         
-        for attempt in range(2):  # first try + one reconnect retry
+        # Run signature check in a thread with timeout.
+        # IMPORTANT: Do NOT call _try_rescan() from inside this thread —
+        # rescan can take 120s which exceeds SIGNATURE_TIMEOUT (15s),
+        # causing a race condition. Just return False and let
+        # read_and_store() handle rescan via the failure counter.
+        result = [None]  # True/False/None(timeout)
+        def _check():
             try:
-                # Re-read client ref each attempt (reconnect replaces it)
-                client = self.modbus.client if hasattr(self.modbus, 'client') else None
-                if client is None:
-                    return True
-                time.sleep(0.1)  # RS485 bus settle
-                res = client.read_holding_registers(sig["wire_addr"], 1, unit=1)
-                if res.isError() or not res.registers:
-                    if attempt == 0:
-                        # First failure — reconnect and retry
-                        self.logger.insert_Info_APP_log(
-                            f"[{self.meter_type}_{self.meter_id}] Signature read failed — "
-                            f"reconnecting and retrying...")
-                        if hasattr(self.modbus, 'reconnect'):
-                            self.modbus.reconnect()
-                        continue
-                    # Second failure — give up, trigger rescan
-                    self.logger.insert_Info_APP_log(
-                        f"[{self.meter_type}_{self.meter_id}] Signature read failed after retry — "
-                        f"triggering detect")
-                    try:
-                        self.modbus.closeConnection()
-                    except Exception:
-                        pass
-                    self._try_rescan()
-                    return False
-                
-                val = res.registers[0]
-                if self._sig_matches(sig, val):
-                    return True  # correct meter, no swap
-                
-                # Wrong value — meter may have been swapped
-                # Try all signatures to find which meter it is
-                for mtype, s in self._signature.items():
-                    if mtype == expected_type:
-                        continue
-                    try:
-                        r = client.read_holding_registers(s["wire_addr"], 1, unit=1)
-                        if not r.isError() and r.registers and self._sig_matches(s, r.registers[0]):
+                for attempt in range(2):
+                    client = self.modbus.client if hasattr(self.modbus, 'client') else None
+                    if client is None:
+                        result[0] = True
+                        return
+                    time.sleep(0.1)
+                    res = client.read_holding_registers(sig["wire_addr"], 1, unit=1)
+                    if res.isError() or not res.registers:
+                        if attempt == 0:
                             self.logger.insert_Info_APP_log(
-                                f"[{self.meter_type}_{self.meter_id}] Meter swap detected: "
-                                f"{expected_type} → {mtype} (reg={s['wire_addr']}, val={r.registers[0]})")
-                            self.meter_type = mtype
-                            self.meter_info["Meter_type"] = mtype
-                            self.meter_info["MQTT_topic"] = mtype.lower() + "_1"
-                            self.meter_label = self.meter_info["MQTT_topic"]
-                            if "expected" in s:
-                                self.meter_info["Serial_Baudrate"] = s["expected"]
-                            self.meterFormat = Format(mtype).getInstance(
-                                self.PanelID, self.meter_id, self.Node, self.meter_info)
-                            self.needs_reinit = True
-                            self._try_rescan()
-                            return False
-                    except Exception:
-                        continue
-                
-                # Couldn't identify — if first attempt, retry with reconnect
-                if attempt == 0:
+                                f"[{self.meter_type}_{self.meter_id}] Signature read failed — "
+                                f"reconnecting and retrying...")
+                            if hasattr(self.modbus, 'reconnect'):
+                                self.modbus.reconnect()
+                            continue
+                        # Second failure — return False, read_and_store will handle rescan
+                        self.logger.insert_Info_APP_log(
+                            f"[{self.meter_type}_{self.meter_id}] Signature read failed after retry")
+                        result[0] = False
+                        return
+                    
+                    val = res.registers[0]
+                    if self._sig_matches(sig, val):
+                        result[0] = True
+                        return
+                    
+                    # Wrong value — return False (let failure counter handle rescan)
                     self.logger.insert_Info_APP_log(
-                        f"[{self.meter_type}_{self.meter_id}] Signature mismatch (val={val}) — "
-                        f"reconnecting and retrying...")
-                    if hasattr(self.modbus, 'reconnect'):
-                        self.modbus.reconnect()
-                    continue
-                
-                # Second attempt also mismatched — trigger full detect
-                self.logger.insert_Info_APP_log(
-                    f"[{self.meter_type}_{self.meter_id}] Signature mismatch after retry "
-                    f"(val={val}) — triggering detect")
-                try:
-                    self.modbus.closeConnection()
-                except Exception:
-                    pass
-                self._try_rescan()
-                return False
-                
+                        f"[{self.meter_type}_{self.meter_id}] Signature mismatch (val={val})")
+                    result[0] = False
+                    return
             except Exception:
-                if attempt == 0:
-                    # First exception — reconnect and retry
-                    self.logger.insert_Info_APP_log(
-                        f"[{self.meter_type}_{self.meter_id}] Signature read exception — "
-                        f"reconnecting and retrying...")
+                # On exception, reconnect but don't rescan (let failure counter handle it)
+                try:
                     if hasattr(self.modbus, 'reconnect'):
                         self.modbus.reconnect()
-                    continue
-                # Second exception — give up
-                self.logger.insert_Info_APP_log(
-                    f"[{self.meter_type}_{self.meter_id}] Signature read exception after retry — "
-                    f"triggering detect")
-                try:
-                    self.modbus.closeConnection()
                 except Exception:
                     pass
-                self._try_rescan()
-                return False
+                result[0] = False  # return False so failure counter increments
+        
+        check_thread = threading.Thread(target=_check, daemon=True)
+        check_thread.start()
+        check_thread.join(timeout=SIGNATURE_TIMEOUT)
+        
+        if check_thread.is_alive():
+            # Signature check hung — skip it and proceed to read
+            self.logger.insert_Error_APP_log(
+                f"[{self.meter_type}_{self.meter_id}] Signature check timed out after {SIGNATURE_TIMEOUT}s — skipping")
+            return True  # proceed with read attempt
+        
+        return result[0] if result[0] is not None else True
 
     def read_and_store(self):
         """Read meter, normalize, store 1-min, log. Returns True on success."""

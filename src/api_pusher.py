@@ -35,10 +35,13 @@ class APIPusher:
         
         Retries failed records every retry_interval (default 5 min)
         so they don't stay stuck until next app restart.
+        Uses exponential backoff when no internet to avoid log flooding.
         """
         self._log_info("API Pusher thread starting")
         retry_interval = self.config.getConfigVal("push_retry_interval", 300)  # 5 min
         last_retry_time = time.time()
+        backoff = 5  # start with 5s backoff
+        MAX_BACKOFF = 300  # max 5 min between retries
         while not self.exiting:
             if not self.enabled:
                 time.sleep(60)
@@ -49,9 +52,11 @@ class APIPusher:
                 if time.time() - last_retry_time > retry_interval:
                     last_retry_time = time.time()
                     self.retry_failed()
+                    backoff = 5  # reset backoff after retry reset
 
                 pending = self.storage.get_pending_15min(limit=20)
                 if pending:
+                    had_failure = False
                     for record in pending:
                         if self.exiting:
                             break
@@ -62,18 +67,26 @@ class APIPusher:
                             if self._consecutive_failures >= 3:
                                 self._send_alert("INFO", f"API push recovered after {self._consecutive_failures} failures")
                             self._consecutive_failures = 0  # reset on success
+                            backoff = 5  # reset backoff on success
                             self._log_info(f"Sent 15min record id={record['id']} ts={record['datetime_str']}")
                         else:
                             self.storage.mark_15min_failed(record["id"])
                             self._consecutive_failures += 1
+                            had_failure = True
                             self._log_error(f"Failed to send record id={record['id']}, will retry")
                             # Alert hub-agent after 3 consecutive failures
                             if self._consecutive_failures == 3:
                                 self._send_alert("WARNING", f"API push failed {self._consecutive_failures} times. Last error: check logs")
                             break  # stop trying more, wait for next cycle
                         time.sleep(0.5)
-                    time.sleep(5)
+                    # Use exponential backoff when failures occur (avoids log spam)
+                    if had_failure:
+                        time.sleep(backoff)
+                        backoff = min(backoff * 2, MAX_BACKOFF)
+                    else:
+                        time.sleep(5)
                 else:
+                    backoff = 5  # reset backoff when no pending records
                     time.sleep(self.interval)
             except Exception as ex:
                 self._log_error("push_thread error", ex)
